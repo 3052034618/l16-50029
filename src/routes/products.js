@@ -12,10 +12,10 @@ const {
 
 router.post('/', createProduct);
 router.post('/bulk', bulkCreateProducts);
+router.get('/stats/count', getCount);
+router.get('/:productId', getProductHandler);
 router.put('/:productId', updateProductHandler);
 router.delete('/:productId', deleteProductHandler);
-router.get('/:productId', getProductHandler);
 router.post('/:productId/sales', incrementSales);
-router.get('/stats/count', getCount);
 
 module.exports = router;

@@ -20,7 +20,7 @@ async function indexProduct(product) {
       index: PRODUCT_INDEX,
       id: doc.productId,
       body: doc,
-      refresh: 'wait_for'
+      refresh: true
     });
     logger.info(`Product ${doc.productId} indexed successfully`);
     return true;
@@ -58,7 +58,7 @@ async function bulkIndexProducts(products) {
     const response = await client.bulk({
       index: PRODUCT_INDEX,
       body,
-      refresh: 'wait_for'
+      refresh: true
     });
 
     if (response.errors) {
@@ -102,7 +102,7 @@ async function updateProduct(productId, updates) {
         doc,
         doc_as_upsert: true
       },
-      refresh: 'wait_for'
+      refresh: true
     });
     logger.info(`Product ${productId} updated successfully`);
     return true;
@@ -127,7 +127,7 @@ async function deleteProduct(productId) {
           updatedAt: new Date()
         }
       },
-      refresh: 'wait_for'
+      refresh: true
     });
     logger.info(`Product ${productId} marked as deleted`);
     return true;
@@ -150,7 +150,7 @@ async function hardDeleteProduct(productId) {
     await client.delete({
       index: PRODUCT_INDEX,
       id: productId,
-      refresh: 'wait_for'
+      refresh: true
     });
     logger.info(`Product ${productId} permanently deleted from index`);
     return true;
@@ -174,6 +174,9 @@ async function getProduct(productId) {
       index: PRODUCT_INDEX,
       id: productId
     });
+    if (response._source && response._source.status === 'deleted') {
+      return null;
+    }
     return response._source;
   } catch (error) {
     if (error.meta && error.meta.statusCode === 404) {
@@ -195,7 +198,7 @@ async function updateProductSalesCount(productId, increment = 1) {
           params: { increment }
         }
       },
-      refresh: 'wait_for'
+      refresh: true
     });
     return true;
   } catch (error) {

@@ -271,83 +271,164 @@ async function getSpellSuggestion(query) {
     return null;
   }
 
-  try {
-    const suggestBody = {
-      suggestion: {
-        text: query,
-        term: {
-          field: 'title',
-          suggest_mode: 'popular',
-          min_word_length: 2,
-          prefix_length: 1,
-          max_edits: 2,
-          size: 5
-        }
-      },
-      phraseSuggestion: {
-        text: query,
-        phrase: {
-          field: 'title',
-          gram_size: 3,
-          max_errors: 2,
-          size: 5,
-          collate: {
-            query: {
-              source: {
-                match: {
-                  title: '{{suggestion}}'
-                }
-              }
-            }
-          }
-        }
-      }
-    };
+  const queryText = query.trim();
+  const queryLower = queryText.toLowerCase();
 
-    const response = await client.search({
+  try {
+    const suggestions = [];
+    const seen = new Set();
+
+    function addCandidate(text, score, source) {
+      if (!text || !text.trim()) return;
+      const normalized = text.trim().toLowerCase();
+      if (normalized === queryLower) return;
+      if (seen.has(normalized)) return;
+      seen.add(normalized);
+      suggestions.push({
+        text: text.trim(),
+        score: score || 0,
+        source: source || 'fuzzy'
+      });
+    }
+
+    const fuzzyResponse = await client.search({
       index: PRODUCT_INDEX,
       body: {
-        suggest: suggestBody,
-        size: 0
+        query: {
+          bool: {
+            filter: [{ term: { status: 'active' } }],
+            should: [
+              {
+                fuzzy: {
+                  title: {
+                    value: queryText,
+                    fuzziness: 'AUTO',
+                    prefix_length: 1,
+                    max_expansions: 50,
+                    boost: 5
+                  }
+                }
+              },
+              {
+                fuzzy: {
+                  brand: {
+                    value: queryText,
+                    fuzziness: 'AUTO',
+                    prefix_length: 1,
+                    max_expansions: 50,
+                    boost: 8
+                  }
+                }
+              },
+              {
+                fuzzy: {
+                  category: {
+                    value: queryText,
+                    fuzziness: 'AUTO',
+                    prefix_length: 1,
+                    max_expansions: 50,
+                    boost: 6
+                  }
+                }
+              },
+              {
+                match: {
+                  title: {
+                    query: queryText,
+                    fuzziness: 'AUTO',
+                    operator: 'or',
+                    boost: 3
+                  }
+                }
+              }
+            ],
+            minimum_should_match: 1
+          }
+        },
+        aggs: {
+          fuzzy_brands: {
+            terms: {
+              field: 'brand',
+              size: 20,
+              order: { _count: 'desc' },
+              min_doc_count: 1
+            }
+          },
+          fuzzy_categories: {
+            terms: {
+              field: 'category',
+              size: 20,
+              order: { _count: 'desc' },
+              min_doc_count: 1
+            }
+          }
+        },
+        _source: ['title', 'brand', 'category', 'salesCount'],
+        size: 50
       }
     });
 
-    const suggestions = [];
-
-    if (response.suggest && response.suggest.phraseSuggestion) {
-      for (const option of response.suggest.phraseSuggestion[0].options) {
-        if (option.score > 0.5 && option.text !== query) {
-          suggestions.push({
-            text: option.text,
-            score: option.score,
-            highlighted: option.highlighted
-          });
+    for (const hit of fuzzyResponse.hits.hits) {
+      const src = hit._source;
+      if (src.brand) {
+        const brandText = src.brand.toString();
+        const sim = calcSimilarity(queryLower, brandText.toLowerCase());
+        if (sim > 0.4 && sim < 1) {
+          addCandidate(brandText, sim * 10 + (hit._score || 0) * 0.1, 'brand');
+        }
+      }
+      if (src.category) {
+        const catText = src.category.toString();
+        const sim = calcSimilarity(queryLower, catText.toLowerCase());
+        if (sim > 0.4 && sim < 1) {
+          addCandidate(catText, sim * 8 + (hit._score || 0) * 0.08, 'category');
+        }
+      }
+      if (src.title) {
+        const titleText = src.title.toString();
+        const sim = calcSimilarity(queryLower, titleText.toLowerCase());
+        if (sim > 0.3 && sim < 1) {
+          addCandidate(titleText, sim * 5 + (hit._score || 0) * 0.05, 'title');
         }
       }
     }
 
-    if (suggestions.length === 0 && response.suggest && response.suggest.suggestion) {
-      const termOptions = response.suggest.suggestion[0].options;
-      for (const option of termOptions) {
-        if (option.text !== query && !suggestions.find(s => s.text === option.text)) {
-          suggestions.push({
-            text: option.text,
-            score: option.score,
-            freq: option.freq
-          });
+    if (fuzzyResponse.aggregations) {
+      if (fuzzyResponse.aggregations.fuzzy_brands) {
+        for (const b of fuzzyResponse.aggregations.fuzzy_brands.buckets) {
+          const sim = calcSimilarity(queryLower, b.key.toLowerCase());
+          if (sim > 0.4 && sim < 1) {
+            addCandidate(b.key, sim * 10 + b.doc_count * 0.01, 'brand_agg');
+          }
+        }
+      }
+      if (fuzzyResponse.aggregations.fuzzy_categories) {
+        for (const c of fuzzyResponse.aggregations.fuzzy_categories.buckets) {
+          const sim = calcSimilarity(queryLower, c.key.toLowerCase());
+          if (sim > 0.4 && sim < 1) {
+            addCandidate(c.key, sim * 8 + c.doc_count * 0.01, 'category_agg');
+          }
         }
       }
     }
 
-    if (suggestions.length === 0) {
-      const distanceSuggestions = await getDistanceBasedSuggestions(query);
-      suggestions.push(...distanceSuggestions);
+    if (suggestions.length < 3) {
+      const distanceSuggestions = await getDistanceBasedSuggestions(queryText);
+      for (const ds of distanceSuggestions) {
+        addCandidate(ds.text, ds.score * 5, 'distance');
+      }
     }
 
+    suggestions.sort((a, b) => b.score - a.score);
     return suggestions.slice(0, 5);
   } catch (error) {
     logger.error('Spell suggestion failed:', error);
-    return null;
+    try {
+      const fallback = await getDistanceBasedSuggestions(queryText);
+      return fallback && fallback.length > 0 ? fallback : null;
+    } catch (e) {
+      return null;
+    }
   }
 }
 
@@ -426,138 +507,303 @@ async function getSearchSuggestions(query) {
   }
 
   const queryText = query.trim();
+  const queryLower = queryText.toLowerCase();
 
   try {
     const response = await client.search({
       index: PRODUCT_INDEX,
       body: {
-        suggest: {
-          completion: {
-            prefix: queryText,
-            completion: {
-              field: 'title.pinyin',
-              size: 10,
-              fuzzy: {
-                fuzziness: 1
-              }
-            }
-          },
-          title_suggest: {
-            prefix: queryText,
-            completion: {
-              field: 'title.pinyin',
-              size: 10
-            }
-          }
-        },
         query: {
           bool: {
-            must: [
-              { match_all: {} }
-            ],
             filter: [
-              { term: { status: 'active' } },
+              { term: { status: 'active' } }
+            ],
+            should: [
               {
-                bool: {
-                  should: [
-                    { prefix: { title: queryText } },
-                    { prefix: { 'title.pinyin': queryText } },
-                    { match_phrase_prefix: { brand: queryText } },
-                    { match_phrase_prefix: { category: queryText } }
-                  ]
+                multi_match: {
+                  query: queryText,
+                  fields: ['title^3', 'title.pinyin^2', 'brand^3', 'brand.pinyin^2', 'category^2'],
+                  type: 'phrase_prefix',
+                  slop: 0,
+                  boost: 5
+                }
+              },
+              {
+                wildcard: {
+                  'title.keyword': {
+                    value: `*${queryText}*`,
+                    case_insensitive: true,
+                    boost: 3
+                  }
+                }
+              },
+              {
+                wildcard: {
+                  brand: {
+                    value: `*${queryText}*`,
+                    case_insensitive: true,
+                    boost: 4
+                  }
+                }
+              },
+              {
+                wildcard: {
+                  category: {
+                    value: `*${queryText}*`,
+                    case_insensitive: true,
+                    boost: 2
+                  }
+                }
+              },
+              {
+                fuzzy: {
+                  title: {
+                    value: queryText,
+                    fuzziness: 'AUTO',
+                    prefix_length: 1,
+                    boost: 1
+                  }
                 }
               }
-            ]
+            ],
+            minimum_should_match: 1
           }
         },
         aggs: {
-          suggestions: {
-            terms: {
-              field: 'title.keyword',
-              size: 10,
-              order: { _count: 'desc' },
-              include: {
-                pattern: `.*${queryText}.*`,
-                flags: 'CASE_INSENSITIVE'
-              }
-            }
-          },
-          brand_suggestions: {
+          hot_brands: {
             terms: {
               field: 'brand',
-              size: 5,
+              size: 10,
               order: { _count: 'desc' },
-              include: {
-                pattern: `.*${queryText}.*`,
-                flags: 'CASE_INSENSITIVE'
-              }
+              min_doc_count: 1
             }
           },
-          category_suggestions: {
+          hot_categories: {
             terms: {
               field: 'category',
-              size: 5,
+              size: 10,
               order: { _count: 'desc' },
-              include: {
-                pattern: `.*${queryText}.*`,
-                flags: 'CASE_INSENSITIVE'
-              }
+              min_doc_count: 1
+            }
+          },
+          hot_tags: {
+            terms: {
+              field: 'tags',
+              size: 10,
+              order: { _count: 'desc' },
+              min_doc_count: 1
             }
           }
         },
-        size: 0
+        _source: ['title', 'brand', 'category', 'salesCount'],
+        size: 30
       }
     });
 
     const suggestions = [];
     const seen = new Set();
 
+    function addSuggestion(text, type, count, score) {
+      if (!text || !text.trim()) return;
+      const key = `${type}:${text.trim().toLowerCase()}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      suggestions.push({
+        text: text.trim(),
+        type,
+        count: count || 0,
+        score: score || 0
+      });
+    }
+
+    for (const hit of response.hits.hits) {
+      const source = hit._source;
+      if (source.brand) {
+        const brand = source.brand.toString();
+        if (
+          brand.toLowerCase().includes(queryLower) ||
+          brand.toLowerCase().startsWith(queryLower)
+        ) {
+          addSuggestion(brand, 'brand', hit._score, hit._score);
+        }
+      }
+      if (source.category) {
+        const cat = source.category.toString();
+        if (
+          cat.toLowerCase().includes(queryLower) ||
+          cat.toLowerCase().startsWith(queryLower)
+        ) {
+          addSuggestion(cat, 'category', hit._score * 0.8, hit._score * 0.8);
+        }
+      }
+      if (source.title) {
+        const title = source.title.toString();
+        addSuggestion(title, 'product', source.salesCount || 0, hit._score);
+      }
+      if (source.tags && Array.isArray(source.tags)) {
+        for (const tag of source.tags) {
+          if (tag && tag.toLowerCase().includes(queryLower)) {
+            addSuggestion(tag, 'tag', hit._score * 0.5, hit._score * 0.5);
+          }
+        }
+      }
+    }
+
     if (response.aggregations) {
-      if (response.aggregations.suggestions) {
-        for (const bucket of response.aggregations.suggestions.buckets) {
-          if (!seen.has(bucket.key)) {
-            seen.add(bucket.key);
-            suggestions.push({
-              text: bucket.key,
-              type: 'product',
-              count: bucket.doc_count
-            });
+      if (response.aggregations.hot_brands) {
+        for (const bucket of response.aggregations.hot_brands.buckets) {
+          if (
+            bucket.key.toLowerCase().includes(queryLower) ||
+            bucket.key.toLowerCase().startsWith(queryLower)
+          ) {
+            addSuggestion(bucket.key, 'brand', bucket.doc_count, bucket.doc_count);
           }
         }
       }
-
-      if (response.aggregations.brand_suggestions) {
-        for (const bucket of response.aggregations.brand_suggestions.buckets) {
-          if (!seen.has(bucket.key)) {
-            seen.add(bucket.key);
-            suggestions.push({
-              text: bucket.key,
-              type: 'brand',
-              count: bucket.doc_count
-            });
+      if (response.aggregations.hot_categories) {
+        for (const bucket of response.aggregations.hot_categories.buckets) {
+          if (
+            bucket.key.toLowerCase().includes(queryLower) ||
+            bucket.key.toLowerCase().startsWith(queryLower)
+          ) {
+            addSuggestion(bucket.key, 'category', bucket.doc_count, bucket.doc_count * 0.8);
           }
         }
       }
-
-      if (response.aggregations.category_suggestions) {
-        for (const bucket of response.aggregations.category_suggestions.buckets) {
-          if (!seen.has(bucket.key)) {
-            seen.add(bucket.key);
-            suggestions.push({
-              text: bucket.key,
-              type: 'category',
-              count: bucket.doc_count
-            });
+      if (response.aggregations.hot_tags) {
+        for (const bucket of response.aggregations.hot_tags.buckets) {
+          if (bucket.key.toLowerCase().includes(queryLower)) {
+            addSuggestion(bucket.key, 'tag', bucket.doc_count, bucket.doc_count * 0.5);
           }
         }
+      }
+    }
+
+    suggestions.sort((a, b) => b.score - a.score);
+
+    if (suggestions.length === 0) {
+      const fallbackSuggestions = await getFallbackSuggestions(queryText);
+      for (const s of fallbackSuggestions) {
+        addSuggestion(s.text, s.type, s.count, s.score);
       }
     }
 
     return suggestions.slice(0, 15);
   } catch (error) {
     logger.error('Search suggestions failed:', error);
+    try {
+      return await getFallbackSuggestions(queryText);
+    } catch (e) {
+      return [];
+    }
+  }
+}
+
+async function getFallbackSuggestions(queryText) {
+  const queryLower = queryText.toLowerCase();
+  try {
+    const response = await client.search({
+      index: PRODUCT_INDEX,
+      body: {
+        query: {
+          bool: {
+            filter: [{ term: { status: 'active' } }]
+          }
+        },
+        aggs: {
+          all_brands: {
+            terms: { field: 'brand', size: 50, order: { _count: 'desc' } }
+          },
+          all_categories: {
+            terms: { field: 'category', size: 50, order: { _count: 'desc' } }
+          }
+        },
+        size: 50,
+        _source: ['title', 'brand', 'category', 'salesCount']
+      }
+    });
+
+    const result = [];
+    const seen = new Set();
+
+    function add(text, type, count, score) {
+      const key = `${type}:${text.toLowerCase()}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      result.push({ text, type, count, score });
+    }
+
+    for (const hit of response.hits.hits) {
+      const src = hit._source;
+      if (src.brand && matchFuzzy(queryLower, src.brand.toString().toLowerCase())) {
+        add(src.brand, 'brand', src.salesCount || 0, calcSimilarity(queryLower, src.brand.toString().toLowerCase()) * 10);
+      }
+      if (src.category && matchFuzzy(queryLower, src.category.toString().toLowerCase())) {
+        add(src.category, 'category', src.salesCount || 0, calcSimilarity(queryLower, src.category.toString().toLowerCase()) * 8);
+      }
+      if (src.title && matchFuzzy(queryLower, src.title.toString().toLowerCase())) {
+        add(src.title, 'product', src.salesCount || 0, calcSimilarity(queryLower, src.title.toString().toLowerCase()) * 5);
+      }
+    }
+
+    if (response.aggregations) {
+      if (response.aggregations.all_brands) {
+        for (const b of response.aggregations.all_brands.buckets) {
+          if (matchFuzzy(queryLower, b.key.toLowerCase())) {
+            add(b.key, 'brand', b.doc_count, calcSimilarity(queryLower, b.key.toLowerCase()) * 10);
+          }
+        }
+      }
+      if (response.aggregations.all_categories) {
+        for (const c of response.aggregations.all_categories.buckets) {
+          if (matchFuzzy(queryLower, c.key.toLowerCase())) {
+            add(c.key, 'category', c.doc_count, calcSimilarity(queryLower, c.key.toLowerCase()) * 8);
+          }
+        }
+      }
+    }
+
+    return result.sort((a, b) => b.score - a.score).slice(0, 10);
+  } catch (e) {
+    logger.error('Fallback suggestions also failed:', e);
     return [];
   }
+}
+
+function matchFuzzy(query, target) {
+  if (!query || !target) return false;
+  if (target.includes(query)) return true;
+  if (query.length <= 2) return target.startsWith(query);
+  const sim = calcSimilarity(query, target);
+  return sim > 0.5;
+}
+
+function calcSimilarity(s1, s2) {
+  if (!s1 || !s2) return 0;
+  if (s1 === s2) return 1;
+  const longer = s1.length > s2.length ? s1 : s2;
+  const shorter = s1.length > s2.length ? s2 : s1;
+  if (longer.length === 0) return 1;
+  let matches = 0;
+  for (let i = 0; i < shorter.length; i++) {
+    if (longer.includes(shorter[i])) matches++;
+  }
+  let consecutive = 0;
+  let maxConsecutive = 0;
+  for (let i = 0; i < shorter.length; i++) {
+    for (let j = 0; j < longer.length; j++) {
+      if (shorter[i] === longer[j]) {
+        let k = 0;
+        while (i + k < shorter.length && j + k < longer.length && shorter[i + k] === longer[j + k]) {
+          k++;
+        }
+        if (k > maxConsecutive) maxConsecutive = k;
+      }
+    }
+  }
+  const baseScore = matches / longer.length;
+  const consecutiveBonus = maxConsecutive / shorter.length;
+  return Math.min(1, baseScore * 0.6 + consecutiveBonus * 0.4);
 }
 
 async function getAggregationFilters(query) {
